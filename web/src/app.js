@@ -4,13 +4,14 @@
 const state = {
   horizon: 1000,
   exposures: [
-    { id: "A", duration: 4, earliest_start: 0, latest_start: 50, equipment: "X", cooling: 2 },
-    { id: "B", duration: 3, earliest_start: 0, latest_start: 50, equipment: "X", cooling: 1 },
-    { id: "C", duration: 5, earliest_start: 0, latest_start: 50, equipment: "Y", cooling: 0 },
-    { id: "D", duration: 2, earliest_start: 0, latest_start: 50, equipment: "Y", cooling: 3 },
-    { id: "E", duration: 6, earliest_start: 2, latest_start: 40, equipment: "Z", cooling: 0 },
+    { id: "A", duration: 4, earliest_start: 0, latest_start: 50, equipment: "X", cooling: 2, startup_demand: 6 },
+    { id: "B", duration: 3, earliest_start: 0, latest_start: 50, equipment: "X", cooling: 1, startup_demand: 5 },
+    { id: "C", duration: 5, earliest_start: 0, latest_start: 50, equipment: "Y", cooling: 0, startup_demand: 1 },
+    { id: "D", duration: 2, earliest_start: 0, latest_start: 50, equipment: "Y", cooling: 3, startup_demand: 1 },
+    { id: "E", duration: 6, earliest_start: 2, latest_start: 40, equipment: "Z", cooling: 0, startup_demand: 1 },
   ],
   links: [{ from_id: "A", to_id: "B", min_gap: 0, max_gap: "" }],
+  cooling: { enabled: false, capacity: 10, initial: 6, recovery: 2 },
   result: null,
   stale: false,
 };
@@ -32,6 +33,7 @@ function renderExpRows() {
       <td><input type="number" min="0" step="1" data-i="${i}" data-k="latest_start" value="${row.latest_start}"></td>
       <td class="cell-eq"><input data-i="${i}" data-k="equipment" value="${row.equipment}"></td>
       <td><input type="number" min="0" step="1" data-i="${i}" data-k="cooling" value="${row.cooling}"></td>
+      <td class="cool-col"><input type="number" min="0" step="1" data-i="${i}" data-k="startup_demand" value="${row.startup_demand ?? 0}"${state.cooling.enabled ? "" : " disabled"}></td>
       <td><button type="button" class="btn secondary" data-del-i="${i}">删除</button></td>`;
     tbody.appendChild(tr);
   });
@@ -170,6 +172,12 @@ function validateDraft() {
     if (Number.isInteger(e.latest_start) && Number.isInteger(e.duration)
         && e.latest_start + e.duration > state.horizon)
       errors.push(`${tag}：最晚结束超过时间范围 H=${state.horizon}`);
+    if (state.cooling.enabled) {
+      if (!Number.isInteger(e.startup_demand))
+        errors.push(`${tag}：启动耗量必须是整数`);
+      else if (e.startup_demand < 0)
+        errors.push(`${tag}：启动耗量不能为负`);
+    }
   });
   const dupes = ids.filter((id, i) => id && ids.indexOf(id) !== i);
   [...new Set(dupes)].forEach((d) => errors.push(`曝光编号重复：${d}`));
@@ -186,6 +194,19 @@ function validateDraft() {
         errors.push(`${tag}：最大间隔小于最小间隔`);
     }
   });
+
+  if (state.cooling.enabled) {
+    const c = state.cooling;
+    if (!Number.isInteger(c.capacity) || c.capacity < 1)
+      errors.push("共享冷量：容量必须是 ≥ 1 的整数");
+    if (!Number.isInteger(c.initial) || c.initial < 0)
+      errors.push("共享冷量：时刻零初始量必须是非负整数");
+    if (!Number.isInteger(c.recovery) || c.recovery < 0)
+      errors.push("共享冷量：每整数时刻恢复量必须是非负整数");
+    if (Number.isInteger(c.capacity) && Number.isInteger(c.initial)
+        && c.initial > c.capacity)
+      errors.push(`共享冷量：初始量（${c.initial}）超过容量（${c.capacity}）`);
+  }
   return errors;
 }
 
@@ -212,6 +233,7 @@ async function solve() {
       latest_start: e.latest_start,
       equipment: String(e.equipment).trim(),
       cooling: e.cooling,
+      startup_demand: state.cooling.enabled ? e.startup_demand : null,
     })),
     links: state.links.map((l) => ({
       from_id: l.from_id,
@@ -219,6 +241,13 @@ async function solve() {
       min_gap: l.min_gap,
       max_gap: l.max_gap === "" ? null : l.max_gap,
     })),
+    shared_cooling: state.cooling.enabled
+      ? {
+          capacity: state.cooling.capacity,
+          initial_amount: state.cooling.initial,
+          recovery_per_time: state.cooling.recovery,
+        }
+      : null,
   };
 
   const btn = $("#solve-btn");
@@ -251,6 +280,9 @@ async function solve() {
     if (!data.feasible) {
       // Valid input, but no executable timing exists.
       $("#infeasible-panel").classList.remove("hidden");
+      $("#infeasible-hint").textContent = state.cooling.enabled
+        ? "建议：放宽最晚开始时刻、错开启动时刻以等待冷量恢复、调大容量/初始量/恢复量或减小启动耗量，也可放宽设备与衔接约束。冷量不足不会返回任何部分排程，也不会沿用旧方案。"
+        : "建议：放宽最晚开始时刻、缩短冷却、错开设备或放松最大衔接间隔。不会返回任何部分曝光方案，也不会沿用旧方案。";
       $("#stale-banner").classList.add("hidden");
       state.stale = false;
       state.result = null;
@@ -286,6 +318,7 @@ function renderResult(r) {
   drawGantt(r);
   drawOrders(r.equipment_orders);
   drawSlacks(r.slacks);
+  drawCooling(r);
 
   $("#result-panel").classList.remove("hidden");
 }
@@ -325,6 +358,162 @@ function drawSlacks(slacks) {
       </tr>`;
     })
     .join("");
+}
+
+/* ---------------- shared coolant account ---------------- */
+
+function drawCooling(r) {
+  const panel = $("#cooling-result");
+  if (!state.cooling.enabled || !r.cooling_events) {
+    panel.classList.add("hidden");
+    return;
+  }
+  panel.classList.remove("hidden");
+  const cfg = state.cooling;
+  const events = r.cooling_events;
+  $("#cool-summary").textContent =
+    `容量 ${cfg.capacity}，时刻零初始量 ${cfg.initial}，每整数时刻恢复 ${cfg.recovery}；` +
+    `共 ${events.length} 次启动扣减，最终余量 ${events[events.length - 1].level_after}。`;
+
+  drawCoolingTimeline(events, cfg);
+  drawCoolingTable(events);
+}
+
+function drawCoolingTable(events) {
+  const tbody = $("#cool-table tbody");
+  tbody.innerHTML = events.map((ev, k) => {
+    let why;
+    if (k === 0) {
+      why = `自时刻零起经过 ${ev.start} 个整数时刻，恢复 ${ev.recovered}` +
+        `（不超过容量 ${state.cooling.capacity}）`;
+    } else {
+      const prev = events[k - 1];
+      const dt = ev.start - prev.start;
+      why = dt === 0
+        ? `与第 ${prev.order + 1} 项（${escapeHtml(prev.exposure_id)}）同一时刻启动，按录入顺序连续扣减、不恢复`
+        : `距上次启动 ${dt} 个时刻，恢复 min(${state.cooling.recovery}×${dt}, 容量−余量) = ${ev.recovered}`;
+    }
+    why += `；扣减 ${ev.demand} 后余量 ${ev.level_after}` +
+      (ev.level_after === 0 ? "（恰好耗尽，仍未透支）" : "");
+    return `<tr>
+      <td>${ev.order + 1}</td>
+      <td>${escapeHtml(ev.exposure_id)}</td>
+      <td>${ev.start}</td>
+      <td>${ev.recovered}</td>
+      <td>${ev.level_before}</td>
+      <td>${ev.demand}</td>
+      <td><strong>${ev.level_after}</strong></td>
+      <td class="muted">${why}</td>
+    </tr>`;
+  }).join("");
+}
+
+function drawCoolingTimeline(events, cfg) {
+  const host = $("#cool-timeline");
+  host.innerHTML = "";
+  const svgNS = "http://www.w3.org/2000/svg";
+  const cap = cfg.capacity;
+  const maxT = Math.max(...events.map((e) => e.start), 1);
+  const mL = 46, mR = 20, mT = 14, mB = 34;
+  const W = Math.max(host.clientWidth - 8, 680);
+  const rowH = 150;
+  const plotW = W - mL - mR;
+  const plotH = rowH - mT - mB;
+  const x = (t) => mL + (t / maxT) * plotW;
+  const y = (lvl) => mT + plotH - (lvl / cap) * plotH;
+
+  const svg = document.createElementNS(svgNS, "svg");
+  svg.setAttribute("width", W);
+  svg.setAttribute("height", rowH);
+  svg.setAttribute("viewBox", `0 0 ${W} ${rowH}`);
+
+  // capacity / zero grid lines
+  for (const [lvl, label, color] of [[cap, `容量 ${cap}`, "#7ee0c8"], [0, "0", "#93a4c0"]]) {
+    const ln = document.createElementNS(svgNS, "line");
+    ln.setAttribute("x1", mL); ln.setAttribute("x2", W - mR);
+    ln.setAttribute("y1", y(lvl)); ln.setAttribute("y2", y(lvl));
+    ln.setAttribute("stroke", color); ln.setAttribute("stroke-dasharray", "4 3");
+    ln.setAttribute("stroke-width", "1");
+    svg.appendChild(ln);
+    const t = document.createElementNS(svgNS, "text");
+    t.setAttribute("x", 6); t.setAttribute("y", y(lvl) + 3);
+    t.setAttribute("fill", color); t.setAttribute("font-size", "9");
+    t.textContent = label;
+    svg.appendChild(t);
+  }
+
+  const addText = (cx, cy, str, color, size = 9, anchor = "middle") => {
+    const t = document.createElementNS(svgNS, "text");
+    t.setAttribute("x", cx); t.setAttribute("y", cy);
+    t.setAttribute("fill", color); t.setAttribute("font-size", size);
+    t.setAttribute("text-anchor", anchor);
+    t.textContent = str;
+    svg.appendChild(t);
+    return t;
+  };
+
+  // Initial charge marker at t=0.
+  addText(x(0) - 4, y(cfg.initial) - 5, `初始 ${cfg.initial}`, "#93a4c0", 9, "end");
+
+  let cursorLvl = cfg.initial;
+  let cursorT = 0;
+  events.forEach((ev) => {
+    // recovery arc (level rises between distinct start times)
+    if (ev.start > cursorT) {
+      const ln = document.createElementNS(svgNS, "line");
+      ln.setAttribute("x1", x(cursorT)); ln.setAttribute("y1", y(cursorLvl));
+      ln.setAttribute("x2", x(ev.start)); ln.setAttribute("y2", y(ev.level_before));
+      ln.setAttribute("stroke", "#4ade80"); ln.setAttribute("stroke-width", "2");
+      svg.appendChild(ln);
+      if (ev.recovered > 0)
+        addText((x(cursorT) + x(ev.start)) / 2, y(ev.level_before) - 5,
+                `+${ev.recovered}`, "#4ade80");
+    }
+    // deduction arrow (vertical at the start instant)
+    const ax = x(ev.start);
+    const arrow = document.createElementNS(svgNS, "line");
+    arrow.setAttribute("x1", ax); arrow.setAttribute("x2", ax);
+    arrow.setAttribute("y1", y(ev.level_before) - 2);
+    arrow.setAttribute("y2", y(ev.level_after) + 2);
+    arrow.setAttribute("stroke", "#4da3ff"); arrow.setAttribute("stroke-width", "2.5");
+    arrow.setAttribute("marker-end", "url(#arrowBlue)");
+    svg.appendChild(arrow);
+
+    const dot = document.createElementNS(svgNS, "circle");
+    dot.setAttribute("cx", ax); dot.setAttribute("cy", y(ev.level_after));
+    dot.setAttribute("r", 3); dot.setAttribute("fill", "#4da3ff");
+    const tip = document.createElementNS(svgNS, "title");
+    tip.textContent =
+      `${ev.exposure_id} @t=${ev.start}：恢复 ${ev.recovered}，` +
+      `扣减前 ${ev.level_before}，耗量 ${ev.demand}，扣减后 ${ev.level_after}`;
+    dot.appendChild(tip);
+    svg.appendChild(dot);
+
+    addText(ax, y(ev.level_after) + (ev.level_after === 0 ? 14 : -7),
+            `${ev.exposure_id} −${ev.demand}`, "#e8eef8");
+    addText(ax, rowH - 18, `t=${ev.start}`, "#93a4c0");
+    cursorLvl = ev.level_after;
+    cursorT = ev.start;
+  });
+
+  // arrowhead marker
+  const defs = document.createElementNS(svgNS, "defs");
+  const marker = document.createElementNS(svgNS, "marker");
+  marker.setAttribute("id", "arrowBlue");
+  marker.setAttribute("markerWidth", "8");
+  marker.setAttribute("markerHeight", "8");
+  marker.setAttribute("refX", "6");
+  marker.setAttribute("refY", "3");
+  marker.setAttribute("orient", "auto");
+  marker.setAttribute("markerUnits", "strokeWidth");
+  const path = document.createElementNS(svgNS, "path");
+  path.setAttribute("d", "M0,0 L6,3 L0,6 z");
+  path.setAttribute("fill", "#4da3ff");
+  marker.appendChild(path);
+  defs.appendChild(marker);
+  svg.insertBefore(defs, svg.firstChild);
+
+  host.appendChild(svg);
 }
 
 /* ---------------- SVG gantt ---------------- */
@@ -438,6 +627,21 @@ function drawGantt(r) {
       lab.setAttribute("font-weight", "700");
       lab.textContent = e.id;
       svg.appendChild(lab);
+
+      if (state.cooling.enabled) {
+        const d = Number.isInteger(e.startup_demand) ? e.startup_demand : 0;
+        const flake = document.createElementNS(svgNS, "text");
+        flake.setAttribute("x", x(start));
+        flake.setAttribute("y", top + 2);
+        flake.setAttribute("fill", "#7ee0c8");
+        flake.setAttribute("font-size", "10");
+        flake.setAttribute("text-anchor", "middle");
+        const ft = document.createElementNS(svgNS, "title");
+        ft.textContent = `${e.id} 启动耗冷量 ${d}（见下方共享冷量账户）`;
+        flake.appendChild(ft);
+        flake.textContent = `❄${d}`;
+        svg.appendChild(flake);
+      }
     });
   });
 
@@ -497,7 +701,7 @@ $("#add-exp").addEventListener("click", () => {
   state.exposures.push({
     id: String.fromCharCode(65 + n),
     duration: 1, earliest_start: 0, latest_start: 100,
-    equipment: "X", cooling: 0,
+    equipment: "X", cooling: 0, startup_demand: 0,
   });
   markDirty();
   renderAll();
@@ -525,8 +729,41 @@ $("#horizon").addEventListener("input", (ev) => {
   state.horizon = ev.target.value === "" ? 0 : Number(ev.target.value);
   markDirty();
 });
+
+/* ---------------- shared cooling wiring ---------------- */
+
+function syncCoolingUi() {
+  const on = state.cooling.enabled;
+  $("#cool-enabled").checked = on;
+  $("#cool-fields").classList.toggle("disabled-area", !on);
+  $("#cool-capacity").value = state.cooling.capacity;
+  $("#cool-initial").value = state.cooling.initial;
+  $("#cool-recovery").value = state.cooling.recovery;
+  $("#cool-capacity").disabled = !on;
+  $("#cool-initial").disabled = !on;
+  $("#cool-recovery").disabled = !on;
+  renderExpRows();
+}
+
+$("#cool-enabled").addEventListener("change", (ev) => {
+  state.cooling.enabled = ev.target.checked;
+  syncCoolingUi();
+  markDirty();
+});
+for (const [id, key] of [
+  ["cool-capacity", "capacity"],
+  ["cool-initial", "initial"],
+  ["cool-recovery", "recovery"],
+]) {
+  $(`#${id}`).addEventListener("input", (ev) => {
+    state.cooling[key] = ev.target.value === "" ? "" : Number(ev.target.value);
+    markDirty();
+  });
+}
+
 $("#solve-btn").addEventListener("click", solve);
 
 renderAll();
+syncCoolingUi();
 checkHealth();
 setInterval(checkHealth, 10000);

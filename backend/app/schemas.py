@@ -13,6 +13,9 @@ class Exposure(BaseModel):
     latest_start: int = Field(..., ge=0)
     equipment: str = Field(..., min_length=1, max_length=64)
     cooling: int = Field(..., ge=0)
+    # Cryogenic coolant consumed at the start instant when shared cooling is
+    # enabled. Ignored (may be null) when shared_cooling is absent.
+    startup_demand: Optional[int] = Field(None, ge=0)
 
     @field_validator("id", "equipment")
     @classmethod
@@ -36,10 +39,26 @@ class Link(BaseModel):
     max_gap: Optional[int] = Field(None, ge=0)
 
 
+class SharedCoolingConfig(BaseModel):
+    """Settings for the shared cryogenic coolant bank.
+
+    The bank starts at ``initial_amount`` at time zero and regains
+    ``recovery_per_time`` units per elapsed integer time unit between
+    distinct start times, never exceeding ``capacity``. Exposures sharing a
+    start time are deducted consecutively in entry order with no recovery
+    between them; the level must never go negative.
+    """
+
+    capacity: int = Field(..., ge=1, le=1_000_000_000)
+    initial_amount: int = Field(..., ge=0, le=1_000_000_000)
+    recovery_per_time: int = Field(..., ge=0, le=1_000_000_000)
+
+
 class ScheduleRequest(BaseModel):
     horizon: int = Field(10_000, ge=1, le=1_000_000)
     exposures: List[Exposure] = Field(..., min_length=5, max_length=10)
     links: List[Link] = Field(default_factory=list)
+    shared_cooling: Optional[SharedCoolingConfig] = None
 
     @field_validator("links")
     @classmethod
@@ -67,6 +86,19 @@ class EquipmentOrder(BaseModel):
     sequence: List[str]
 
 
+class CoolingEvent(BaseModel):
+    """One startup deduction against the shared coolant bank, in the global
+    chronological start-event order (same start time -> entry order)."""
+
+    order: int
+    exposure_id: str
+    start: int
+    recovered: int
+    level_before: int
+    level_after: int
+    demand: int
+
+
 class SolutionPayload(BaseModel):
     feasible: bool
     reason: Optional[str] = None
@@ -77,4 +109,5 @@ class SolutionPayload(BaseModel):
     sum_starts: Optional[int] = None
     slacks: Optional[List[SlackInfo]] = None
     equipment_orders: Optional[List[EquipmentOrder]] = None
+    cooling_events: Optional[List[CoolingEvent]] = None
     solver_time_ms: Optional[int] = None

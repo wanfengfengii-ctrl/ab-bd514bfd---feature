@@ -8,6 +8,14 @@ Optimization order (lexicographic):
 Each exposure occupies its equipment from ``start`` to ``start + duration +
 cooling``; intervals on the same equipment may not overlap, which enforces both
 exclusive equipment use and the post-exposure cooling window.
+
+When ``shared_cooling`` is enabled, all startups draw from one cryogenic
+coolant bank. The bank is modeled jointly with the start times: startups are
+ordered chronologically (ties broken by entry order), the bank recovers
+``recovery_per_time`` units per elapsed integer time unit between time zero and
+the first startup and between distinct startup times (never above capacity),
+same-time startups deduct consecutively with no recovery in between, and the
+level is constrained non-negative after every single deduction.
 """
 from __future__ import annotations
 
@@ -17,7 +25,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ortools.sat.python import cp_model
 
-from .schemas import EquipmentOrder, Exposure, Link, ScheduleRequest, SlackInfo
+from .schemas import (
+    CoolingEvent,
+    EquipmentOrder,
+    Exposure,
+    Link,
+    ScheduleRequest,
+    SlackInfo,
+)
 
 
 class InputValidationError(ValueError):
@@ -66,6 +81,20 @@ def validate_request(req: ScheduleRequest) -> None:
             errors.append(f"duplicate link {ln.from_id}->{ln.to_id}")
         pair_seen.add(key)
 
+    sc = req.shared_cooling
+    if sc is not None:
+        if sc.initial_amount > sc.capacity:
+            errors.append(
+                f"shared_cooling.initial_amount ({sc.initial_amount}) exceeds "
+                f"capacity ({sc.capacity})"
+            )
+        missing = [e.id for e in req.exposures if e.startup_demand is None]
+        if missing:
+            errors.append(
+                "shared_cooling enabled but startup_demand missing for: "
+                + ", ".join(missing)
+            )
+
     if errors:
         raise InputValidationError(errors)
 
@@ -109,12 +138,112 @@ def _build_model(req: ScheduleRequest) -> Tuple[cp_model.CpModel, Dict[str, Any]
     sum_starts = model.new_int_var(0, H * n, "sum_starts")
     model.add(sum_starts == sum(starts))
 
+    bank_vars: Dict[str, Any] = {}
+    if req.shared_cooling is not None:
+        bank_vars = _add_shared_cooling(model, starts, req)
+
     return model, {
         "starts": starts,
         "ends": ends,
         "occupy_until": occupy_until,
         "makespan": makespan,
         "sum_starts": sum_starts,
+        **bank_vars,
+    }
+
+
+def _add_shared_cooling(
+    model: cp_model.CpModel,
+    starts: List[cp_model.IntVar],
+    req: ScheduleRequest,
+) -> Dict[str, Any]:
+    """Jointly model the shared cryogenic coolant bank with the start times.
+
+    Startups are placed on a global event line in chronological order; at an
+    equal start time the entry order wins. Recovery happens only across a
+    positive elapsed gap (hence never between same-time startups, which are
+    consecutive) and is capped at the bank capacity. Every post-deduction
+    level is constrained >= 0, so an unaffordable startup makes the whole
+    timing infeasible rather than being filtered out after optimization.
+    """
+    sc = req.shared_cooling
+    assert sc is not None
+    exps = req.exposures
+    n = len(exps)
+    H = req.horizon
+    cap = sc.capacity
+    rate = sc.recovery_per_time
+    initial = sc.initial_amount
+    demands = [e.startup_demand or 0 for e in exps]
+
+    # ---- global ordering of start events ---------------------------------
+    # pos[i] is the event position of exposure i; inv is its inverse.
+    pos = [model.new_int_var(0, n - 1, f"cool_pos_{e.id}") for e in exps]
+    inv = [model.new_int_var(0, n - 1, f"cool_inv_{p}") for p in range(n)]
+    model.add_all_different(pos)
+    model.add_inverse(pos, inv)
+
+    # Sorting validity: position order agrees with (start, entry) order.
+    for i in range(n):
+        for j in range(i + 1, n):
+            before = model.new_bool_var(f"pos_{exps[i].id}_before_{exps[j].id}")
+            after = model.new_bool_var(f"pos_{exps[i].id}_after_{exps[j].id}")
+            earlier = model.new_bool_var(f"start_{exps[i].id}_lt_{exps[j].id}")
+            later = model.new_bool_var(f"start_{exps[i].id}_gt_{exps[j].id}")
+            tie = model.new_bool_var(f"start_{exps[i].id}_eq_{exps[j].id}")
+            model.add(pos[i] + 1 <= pos[j]).only_enforce_if(before)
+            model.add(pos[j] + 1 <= pos[i]).only_enforce_if(after)
+            model.add(starts[i] + 1 <= starts[j]).only_enforce_if(earlier)
+            model.add(starts[j] + 1 <= starts[i]).only_enforce_if(later)
+            model.add(starts[i] == starts[j]).only_enforce_if(tie)
+            # Exactly one temporal relation and one positional relation hold.
+            model.add_bool_or([earlier, later, tie])
+            model.add_bool_or([before, after])
+            # Ties are broken by entry order; otherwise order follows time.
+            model.add_bool_or([before, ~tie])
+            model.add_bool_or([~after, ~tie])
+            model.add_bool_or([~earlier, before])
+            model.add_bool_or([~later, after])
+
+    # Start time / demand at each event position.
+    ostart = [model.new_int_var(0, H, f"cool_t_{p}") for p in range(n)]
+    dem_at = [model.new_int_var(0, max(demands, default=0), f"cool_d_{p}")
+              for p in range(n)]
+    for p in range(n):
+        model.add_element(inv[p], starts, ostart[p])
+        model.add_element(inv[p], demands, dem_at[p])
+    for p in range(1, n):
+        model.add(ostart[p] >= ostart[p - 1])
+
+    # ---- bank level along the event line ---------------------------------
+    gap = [ostart[0]] + [ostart[p] - ostart[p - 1] for p in range(1, n)]
+    recovered: List[cp_model.IntVar] = []
+    level_before: List[cp_model.IntVar] = []
+    level_after: List[cp_model.IntVar] = []
+    for p in range(n):
+        prev_level = initial if p == 0 else level_after[p - 1]
+        before = model.new_int_var(0, cap, f"cool_before_{p}")
+        after = model.new_int_var(0, cap, f"cool_after_{p}")
+        rec = model.new_int_var(0, cap, f"cool_rec_{p}")
+        # Recovery over the elapsed gap, capped so the level never exceeds
+        # capacity; a zero gap (same-time, consecutive event) yields zero.
+        model.add_min_equality(before, [prev_level + rate * gap[p], cap])
+        model.add(rec == before - prev_level)
+        model.add(after == before - dem_at[p])
+        # Never overdraw: level must stay non-negative after each deduction.
+        model.add(after >= 0)
+        recovered.append(rec)
+        level_before.append(before)
+        level_after.append(after)
+
+    return {
+        "cool_pos": pos,
+        "cool_inv": inv,
+        "cool_ostart": ostart,
+        "cool_recovered": recovered,
+        "cool_level_before": level_before,
+        "cool_level_after": level_after,
+        "cool_dem_at": dem_at,
     }
 
 
@@ -224,6 +353,26 @@ def solve(req: ScheduleRequest, phase_seconds: float = 10.0) -> Dict[str, Any]:
         for eq, items in sorted(grouped.items())
     ]
 
+    # Shared-coolant bank trace along the global startup event order. The
+    # final lex-phase model/solver is still available, so read its bank vars.
+    cooling_events: Optional[List[Dict[str, Any]]] = None
+    if req.shared_cooling is not None:
+        events: List[CoolingEvent] = []
+        for p in range(n):
+            idx = solver.value(v["cool_inv"][p])
+            events.append(
+                CoolingEvent(
+                    order=p,
+                    exposure_id=exps[idx].id,
+                    start=starts[idx],
+                    recovered=solver.value(v["cool_recovered"][p]),
+                    level_before=solver.value(v["cool_level_before"][p]),
+                    level_after=solver.value(v["cool_level_after"][p]),
+                    demand=exps[idx].startup_demand or 0,
+                )
+            )
+        cooling_events = [ev.model_dump() for ev in events]
+
     return {
         "feasible": True,
         "starts": starts,
@@ -232,5 +381,6 @@ def solve(req: ScheduleRequest, phase_seconds: float = 10.0) -> Dict[str, Any]:
         "sum_starts": sum(starts),
         "slacks": [s.model_dump() for s in slacks],
         "equipment_orders": [o.model_dump() for o in equipment_orders],
+        "cooling_events": cooling_events,
         "solver_time_ms": int((time.perf_counter() - t0) * 1000),
     }
