@@ -4,13 +4,14 @@
 const state = {
   horizon: 1000,
   exposures: [
-    { id: "A", duration: 4, earliest_start: 0, latest_start: 50, equipment: "X", cooling: 2 },
-    { id: "B", duration: 3, earliest_start: 0, latest_start: 50, equipment: "X", cooling: 1 },
-    { id: "C", duration: 5, earliest_start: 0, latest_start: 50, equipment: "Y", cooling: 0 },
-    { id: "D", duration: 2, earliest_start: 0, latest_start: 50, equipment: "Y", cooling: 3 },
-    { id: "E", duration: 6, earliest_start: 2, latest_start: 40, equipment: "Z", cooling: 0 },
+    { id: "A", duration: 4, earliest_start: 0, latest_start: 50, equipment: "X", cooling: 2, startup_consumption: 3 },
+    { id: "B", duration: 3, earliest_start: 0, latest_start: 50, equipment: "X", cooling: 1, startup_consumption: 3 },
+    { id: "C", duration: 5, earliest_start: 0, latest_start: 50, equipment: "Y", cooling: 0, startup_consumption: 3 },
+    { id: "D", duration: 2, earliest_start: 0, latest_start: 50, equipment: "Y", cooling: 3, startup_consumption: 3 },
+    { id: "E", duration: 6, earliest_start: 2, latest_start: 40, equipment: "Z", cooling: 0, startup_consumption: 3 },
   ],
   links: [{ from_id: "A", to_id: "B", min_gap: 0, max_gap: "" }],
+  cooling: { enabled: false, capacity: 10, initial: 10, recovery: 5 },
   result: null,
   stale: false,
 };
@@ -32,6 +33,7 @@ function renderExpRows() {
       <td><input type="number" min="0" step="1" data-i="${i}" data-k="latest_start" value="${row.latest_start}"></td>
       <td class="cell-eq"><input data-i="${i}" data-k="equipment" value="${row.equipment}"></td>
       <td><input type="number" min="0" step="1" data-i="${i}" data-k="cooling" value="${row.cooling}"></td>
+      <td class="cool-col"><input type="number" min="0" step="1" data-i="${i}" data-k="startup_consumption" value="${row.startup_consumption ?? 0}"></td>
       <td><button type="button" class="btn secondary" data-del-i="${i}">删除</button></td>`;
     tbody.appendChild(tr);
   });
@@ -51,6 +53,7 @@ function renderExpRows() {
     });
   });
   syncLinkIdOptions();
+  syncCoolingUI();
 }
 
 function onExpInput(ev) {
@@ -122,6 +125,29 @@ function reconcileLinks() {
   state.links = state.links.filter((l) => ids.has(l.from_id) && ids.has(l.to_id));
 }
 
+/* ---------------- shared cooling ---------------- */
+
+function syncCoolingUI() {
+  const on = state.cooling.enabled;
+  $("#cool-enabled").checked = on;
+  $("#cool-fields").classList.toggle("disabled-block", !on);
+  document.querySelectorAll("#exp-table .cool-col").forEach((el) =>
+    el.classList.toggle("cool-off", !on));
+}
+
+function onCoolToggle(ev) {
+  state.cooling.enabled = ev.target.checked;
+  syncCoolingUI();
+  markDirty();
+}
+
+function onCoolField(ev) {
+  const k = ev.target.id.replace("cool-", "");
+  const v = ev.target.value === "" ? "" : Number(ev.target.value);
+  state.cooling[k] = v;
+  markDirty();
+}
+
 function renderAll() {
   renderExpRows();
   renderLinkRows();
@@ -170,9 +196,25 @@ function validateDraft() {
     if (Number.isInteger(e.latest_start) && Number.isInteger(e.duration)
         && e.latest_start + e.duration > state.horizon)
       errors.push(`${tag}：最晚结束超过时间范围 H=${state.horizon}`);
+    if (state.cooling.enabled) {
+      if (!Number.isInteger(e.startup_consumption) || e.startup_consumption < 0)
+        errors.push(`${tag}：启动耗量必须是非负整数`);
+    }
   });
   const dupes = ids.filter((id, i) => id && ids.indexOf(id) !== i);
   [...new Set(dupes)].forEach((d) => errors.push(`曝光编号重复：${d}`));
+
+  if (state.cooling.enabled) {
+    const c = state.cooling;
+    for (const [k, label] of [["capacity", "冷量容量"], ["initial", "时刻零初始量"],
+                              ["recovery", "每整数时刻恢复量"]]) {
+      if (!Number.isInteger(c[k]) || c[k] < 0)
+        errors.push(`共享冷量：${label}必须是非负整数`);
+    }
+    if (Number.isInteger(c.capacity) && Number.isInteger(c.initial)
+        && c.initial > c.capacity)
+      errors.push(`共享冷量：初始量（${c.initial}）超过容量（${c.capacity}）`);
+  }
 
   state.links.forEach((ln, i) => {
     const tag = `约束 ${i + 1}（${ln.from_id} → ${ln.to_id}）`;
@@ -212,6 +254,8 @@ async function solve() {
       latest_start: e.latest_start,
       equipment: String(e.equipment).trim(),
       cooling: e.cooling,
+      startup_consumption: Number.isInteger(e.startup_consumption)
+        ? e.startup_consumption : 0,
     })),
     links: state.links.map((l) => ({
       from_id: l.from_id,
@@ -220,6 +264,13 @@ async function solve() {
       max_gap: l.max_gap === "" ? null : l.max_gap,
     })),
   };
+  if (state.cooling.enabled) {
+    payload.shared_cooling = {
+      capacity: state.cooling.capacity,
+      initial: state.cooling.initial,
+      recovery: state.cooling.recovery,
+    };
+  }
 
   const btn = $("#solve-btn");
   btn.disabled = true;
@@ -250,6 +301,7 @@ async function solve() {
     }
     if (!data.feasible) {
       // Valid input, but no executable timing exists.
+      renderObstruction(data);
       $("#infeasible-panel").classList.remove("hidden");
       $("#stale-banner").classList.add("hidden");
       state.stale = false;
@@ -284,10 +336,72 @@ function renderResult(r) {
   $("#m-time").textContent = `${r.solver_time_ms} ms`;
 
   drawGantt(r);
+  drawCoolingLedger(r);
   drawOrders(r.equipment_orders);
   drawSlacks(r.slacks);
 
   $("#result-panel").classList.remove("hidden");
+}
+
+function renderObstruction(data) {
+  const box = $("#cooling-obstruction");
+  const ob = data.cooling_obstruction;
+  if (!state.cooling.enabled || !ob) {
+    box.classList.add("hidden");
+    box.innerHTML = "";
+    return;
+  }
+  box.classList.remove("hidden");
+  box.innerHTML =
+    `<strong>冷量在第 ${ob.entry_index + 1} 项曝光「${escapeHtml(ob.exposure_id)}」启动时耗尽。</strong>` +
+    `<br/>仅考虑时间窗与共享冷量（放宽设备与衔接）时，前 ${ob.feasible_count} 项尚可行，` +
+    `加入「${escapeHtml(ob.exposure_id)}」后在其允许的启动窗口内无论何时启动都无足够冷量；` +
+    `因此整体无解，且不返回任何部分排程。可增大容量/恢复量、调小该项启动耗量或放宽其最晚开始时刻。`;
+}
+
+function drawCoolingLedger(r) {
+  const wrap = $("#cooling-ledger-wrap");
+  const tbody = $("#cooling-table tbody");
+  const trace = r.cooling_trace;
+  if (!state.cooling.enabled || !trace) {
+    wrap.classList.add("hidden");
+    $("#cool-legend").classList.add("hidden");
+    tbody.innerHTML = "";
+    return;
+  }
+  wrap.classList.remove("hidden");
+  $("#cool-legend").classList.remove("hidden");
+  const cap = state.cooling.capacity;
+  let prevT = null;
+  tbody.innerHTML = trace.map((s, k) => {
+    let note;
+    if (k === 0) {
+      note = s.recovery > 0
+        ? `时刻零初始量经 ${s.start} 个时刻恢复 ${s.recovery}（已按容量 ${cap} 封顶）`
+        : `时刻零直接启动，无恢复（初始量 ${s.level_before}）`;
+    } else if (s.start === prevT) {
+      note = "与上一项同一时刻启动，连续扣减、不恢复";
+    } else {
+      note = `经过 ${s.start - prevT} 个时刻恢复 ${s.recovery}` +
+        (s.level_before >= cap ? "，已达容量上限" : "");
+    }
+    if (s.level_after === 0) note += "；扣减后冷量为 0";
+    prevT = s.start;
+    return `<tr${s.level_after === 0 ? ' class="row-zero"' : ""}>
+      <td class="muted">${k + 1}</td>
+      <td>${escapeHtml(s.exposure_id)}</td>
+      <td>${s.start}</td>
+      <td>${s.recovery}</td>
+      <td>${s.level_before}</td>
+      <td>${s.consumption}</td>
+      <td>${s.level_after}</td>
+      <td class="note">${escapeHtml(note)}</td>
+    </tr>`;
+  }).join("");
+  $("#cooling-ledger-hint").textContent =
+    `容量 ${cap}、初始量 ${state.cooling.initial}、每时刻恢复 ${state.cooling.recovery}；` +
+    `每次启动后冷量均 ≥ 0。时间轴上菱形标记各次启动扣减（黄色表示扣减后为 0），悬停可见台账；` +
+    `延后启动的项目正是为等待冷量恢复。`;
 }
 
 function drawOrders(orders) {
@@ -338,6 +452,10 @@ function drawGantt(r) {
   exps.forEach((e, i) => {
     byEq.get(e.equipment).push({ e, i, start: r.starts[i], finish: r.finishes[i] });
   });
+
+  // Cooling ledger keyed by exposure id for startup-draw markers.
+  const coolById = new Map();
+  (r.cooling_trace || []).forEach((s) => coolById.set(s.exposure_id, s));
 
   const maxT = Math.max(
     ...exps.map((e, i) => r.finishes[i] + e.cooling),
@@ -438,6 +556,26 @@ function drawGantt(r) {
       lab.setAttribute("font-weight", "700");
       lab.textContent = e.id;
       svg.appendChild(lab);
+
+      // Shared-cooling startup draw marker (diamond at the start instant).
+      const cs = coolById.get(e.id);
+      if (cs) {
+        const d = 7;
+        const cx = x(start);
+        const cy = top + 4;
+        const dia = document.createElementNS(svgNS, "polygon");
+        dia.setAttribute("points",
+          `${cx},${cy - d} ${cx + d},${cy} ${cx},${cy + d} ${cx - d},${cy}`);
+        dia.setAttribute("fill", cs.level_after === 0 ? "#ffc857" : "#36e0c0");
+        dia.setAttribute("stroke", "#0b1626");
+        dia.setAttribute("stroke-width", "1");
+        const ct = document.createElementNS(svgNS, "title");
+        ct.textContent =
+          `${e.id} 启动扣冷量：扣减前 ${cs.level_before} − 耗量 ${cs.consumption} ` +
+          `= 扣减后 ${cs.level_after}；本次恢复 ${cs.recovery}`;
+        dia.appendChild(ct);
+        svg.appendChild(dia);
+      }
     });
   });
 
@@ -497,7 +635,7 @@ $("#add-exp").addEventListener("click", () => {
   state.exposures.push({
     id: String.fromCharCode(65 + n),
     duration: 1, earliest_start: 0, latest_start: 100,
-    equipment: "X", cooling: 0,
+    equipment: "X", cooling: 0, startup_consumption: 0,
   });
   markDirty();
   renderAll();
@@ -525,8 +663,12 @@ $("#horizon").addEventListener("input", (ev) => {
   state.horizon = ev.target.value === "" ? 0 : Number(ev.target.value);
   markDirty();
 });
+$("#cool-enabled").addEventListener("change", onCoolToggle);
+["cool-capacity", "cool-initial", "cool-recovery"].forEach((id) =>
+  $("#" + id).addEventListener("input", onCoolField));
 $("#solve-btn").addEventListener("click", solve);
 
+syncCoolingUI();
 renderAll();
 checkHealth();
 setInterval(checkHealth, 10000);

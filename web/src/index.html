@@ -27,11 +27,37 @@
             <tr>
               <th>#</th><th>编号</th><th>持续时间</th>
               <th>最早开始</th><th>最晚开始</th>
-              <th>设备</th><th>冷却时间</th><th></th>
+              <th>设备</th><th>冷却时间</th>
+              <th class="cool-col">启动耗量</th><th></th>
             </tr>
           </thead>
           <tbody></tbody>
         </table>
+      </div>
+    </section>
+
+    <section class="card" id="cooling-card">
+      <div class="card-head">
+        <h2>共享低温冷量（同一套低温机组）</h2>
+        <label class="cool-toggle">
+          <input type="checkbox" id="cool-enabled" /> 启用共享冷量
+        </label>
+      </div>
+      <div id="cool-fields" class="cool-fields disabled-block">
+        <label>冷量容量
+          <input type="number" id="cool-capacity" min="0" step="1" value="10" />
+        </label>
+        <label>时刻零初始量
+          <input type="number" id="cool-initial" min="0" step="1" value="10" />
+        </label>
+        <label>每整数时刻恢复量
+          <input type="number" id="cool-recovery" min="0" step="1" value="5" />
+        </label>
+        <p class="hint">
+          从时刻零到首次启动、以及相邻不同启动时刻之间按经过时间恢复（不超过容量）；
+          同一时刻启动的项目按录入顺序连续扣减、中间不恢复，每次扣减后冷量不得为负。
+          该约束直接参与三阶段联合求解，冷量不足时整体无解，不返回部分排程。
+        </p>
       </div>
     </section>
 
@@ -77,6 +103,7 @@
     <section id="infeasible-panel" class="card warn-card hidden">
       <h2>无可执行时序</h2>
       <p>输入通过了全部校验，但不存在同时满足时间窗、设备占用（含冷却）与衔接约束的整数开始时刻组合。</p>
+      <div id="cooling-obstruction" class="obstruction hidden"></div>
       <p class="hint">建议：放宽最晚开始时刻、缩短冷却、错开设备或放松最大衔接间隔。不会返回任何部分曝光方案，也不会沿用旧方案。</p>
     </section>
 
@@ -95,6 +122,25 @@
         <span class="legend-item"><i class="sw exposure"></i>曝光执行</span>
         <span class="legend-item"><i class="sw cooling"></i>设备冷却占用</span>
         <span class="legend-item"><i class="sw window"></i>可开始时间窗</span>
+        <span class="legend-item cool-legend-item hidden" id="cool-legend">
+          <i class="sw cooldraw"></i>共享冷量启动扣减
+        </span>
+      </div>
+
+      <div id="cooling-ledger-wrap" class="hidden">
+        <h3>共享冷量台账（按全局启动顺序）</h3>
+        <p class="hint" id="cooling-ledger-hint"></p>
+        <div class="table-wrap">
+          <table id="cooling-table">
+            <thead>
+              <tr>
+                <th>顺序</th><th>曝光</th><th>启动时刻</th><th>本次恢复</th>
+                <th>扣减前</th><th>启动耗量</th><th>扣减后</th><th>说明</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
       </div>
 
       <h3>设备执行顺序</h3>

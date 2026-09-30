@@ -172,3 +172,44 @@ td .btn { padding: 3px 9px; font-size: 12px; }
   border-radius: 999px; padding: 3px 12px;
 }
 .arrow { color: var(--muted); }
+
+/* shared cooling */
+.cool-toggle {
+  display: inline-flex; align-items: center; gap: 8px;
+  color: var(--text); font-size: 13px; cursor: pointer;
+}
+.cool-toggle input { width: auto; }
+.cool-fields {
+  display: flex; gap: 18px; flex-wrap: wrap; align-items: flex-start;
+}
+.cool-fields label {
+  color: var(--muted); font-size: 13px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.cool-fields input {
+  width: 120px; background: #0f1622; border: 1px solid var(--line);
+  color: var(--text); border-radius: 6px; padding: 6px 8px;
+}
+.cool-fields .hint { flex-basis: 100%; }
+.disabled-block { opacity: .45; pointer-events: none; }
+#exp-table th.cool-col, #exp-table td.cool-col {
+  background: rgba(138, 125, 255, .08);
+}
+#exp-table td.cool-col.cool-off, #exp-table th.cool-col.cool-off {
+  background: transparent;
+}
+td.cool-col input { width: 96px; }
+.sw.cooldraw {
+  background: #36e0c0; transform: rotate(45deg);
+  width: 9px; height: 9px; border-radius: 2px;
+}
+#cooling-table td.note { white-space: normal; color: var(--muted); }
+#cooling-table tr.row-zero td { color: var(--warn); font-weight: 600; }
+.obstruction {
+  background: rgba(255, 107, 107, .1);
+  border: 1px solid rgba(255, 107, 107, .45);
+  color: var(--text);
+  border-radius: 10px; padding: 12px 14px; margin: 12px 0;
+  font-size: 13px; line-height: 1.7;
+}
+.obstruction strong { color: var(--danger); }

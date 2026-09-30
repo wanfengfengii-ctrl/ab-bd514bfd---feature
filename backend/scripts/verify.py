@@ -2,10 +2,13 @@
 """One-shot verification for the beamline scheduler stack.
 
 Aggregated exit code is a bitmask (0 = everything passed):
-    bit 0 (1)  code tests (pytest)
-    bit 1 (2)  build / static integrity checks
-    bit 2 (4)  feasible schedule produced by the solver
-    bit 3 (8)  infeasible-input API smoke (200 + feasible=false, no partial)
+    bit 0 (1)   code tests (pytest)
+    bit 1 (2)   build / static integrity checks
+    bit 2 (4)   feasible schedule produced by the solver
+    bit 3 (8)   infeasible-input API smoke (200 + feasible=false, no partial)
+    bit 4 (16)  shared-cooling API smoke (cooling forces later starts;
+                insufficient cooling yields 200 feasible=false with a null
+                trace, and initial>capacity is a 400 input error)
 """
 from __future__ import annotations
 
@@ -84,6 +87,23 @@ def _five(exposures):
             for (eid, dur, es, ls, eq, cool) in exposures
         ],
         "links": [],
+    }
+
+
+def _cooling_five(consumptions, sc, latest=50):
+    """Five independent-equipment exposures with startup draws."""
+    return {
+        "horizon": 1000,
+        "exposures": [
+            {
+                "id": chr(65 + i), "duration": 1, "earliest_start": 0,
+                "latest_start": latest, "equipment": chr(88 + i), "cooling": 0,
+                "startup_consumption": consumptions[i],
+            }
+            for i in range(5)
+        ],
+        "links": [],
+        "shared_cooling": sc,
     }
 
 
@@ -178,21 +198,116 @@ def check_api_infeasible():
         raise RuntimeError(f"web health failed: {exc}") from exc
 
 
+def _replay_cooling(body, data):
+    """Independently replay the cooler ledger from starts, matching the spec."""
+    sc = body["shared_cooling"]
+    exps = {e["id"]: e for e in body["exposures"]}
+    order = sorted(
+        range(len(body["exposures"])),
+        key=lambda i: (data["starts"][i], i),
+    )
+    level, prev_t, steps = None, None, []
+    for i in order:
+        t = data["starts"][i]
+        rec = t * sc["recovery"] if level is None else (
+            0 if t == prev_t else (t - prev_t) * sc["recovery"])
+        level = min(sc["capacity"], (sc["initial"] if level is None else level) + rec)
+        before = level
+        after = before - exps[body["exposures"][i]["id"]]["startup_consumption"]
+        if after < 0:
+            raise RuntimeError(f"cooling went negative at {body['exposures'][i]['id']}")
+        steps.append((body["exposures"][i]["id"], t, rec, before,
+                      exps[body["exposures"][i]["id"]]["startup_consumption"], after))
+        level, prev_t = after, t
+    return steps
+
+
+@section("shared-cooling API smoke")
+def check_shared_cooling():
+    sc = {"capacity": 10, "initial": 10, "recovery": 5}
+    draws = [3, 3, 3, 3, 3]
+
+    with httpx.Client(base_url=API_URL, timeout=60) as cli:
+        # Baseline: without shared cooling every independent exposure starts 0.
+        plain = _cooling_five(draws, sc)
+        plain.pop("shared_cooling")
+        rb = cli.post("/api/schedule", json=plain)
+        rb.raise_for_status()
+        base_starts = rb.json()["starts"]
+        if any(s != 0 for s in base_starts):
+            raise RuntimeError(f"baseline starts unexpectedly delayed: {base_starts}")
+
+        # Enabled: the cooler must force later starts (in-model, not filtered).
+        body = _cooling_five(draws, sc)
+        r = cli.post("/api/schedule", json=body)
+        if r.status_code != 200:
+            raise RuntimeError(f"cooling feasible case HTTP {r.status_code}: {r.text[:200]}")
+        data = r.json()
+        if not data.get("feasible"):
+            raise RuntimeError(f"expected feasible with cooling, got {data}")
+        starts = data["starts"]
+        if not any(s > 0 for s in starts):
+            raise RuntimeError("cooling did not force any later start")
+        if starts[:3] != [0, 0, 0]:
+            raise RuntimeError(f"first three 3-unit draws should fit at t=0: {starts}")
+        trace = data.get("cooling_trace")
+        if not trace or len(trace) != 5:
+            raise RuntimeError(f"missing/incomplete cooling_trace: {trace}")
+        replay = _replay_cooling(body, data)
+        got = [(s["exposure_id"], s["start"], s["recovery"],
+                s["level_before"], s["consumption"], s["level_after"]) for s in trace]
+        if got != replay:
+            raise RuntimeError(f"cooling trace mismatch:\n api={got}\n replay={replay}")
+        if any(s["level_after"] < 0 for s in trace):
+            raise RuntimeError("negative post-draw level returned")
+        print(f"  starts={starts} trace={len(trace)} steps, ledger independently verified")
+
+        # Insufficient cooling, tight windows: 200 feasible=false, no partial.
+        bad_body = _cooling_five(
+            [6, 6, 0, 0, 0],
+            {"capacity": 10, "initial": 10, "recovery": 0}, latest=4)
+        r2 = cli.post("/api/schedule", json=bad_body)
+        if r2.status_code != 200:
+            raise RuntimeError(f"expected 200 for cooling-infeasible, got {r2.status_code}")
+        d2 = r2.json()
+        if d2.get("feasible") is not False or d2.get("reason") != "no_schedule":
+            raise RuntimeError(f"unexpected cooling-infeasible payload: {d2}")
+        if any(d2.get(k) is not None for k in
+               ("starts", "finishes", "makespan", "cooling_trace")):
+            raise RuntimeError("partial schedule/trace returned on cooling failure")
+        ob = d2.get("cooling_obstruction")
+        if not ob or ob.get("exposure_id") != "B" or ob.get("entry_index") != 1:
+            raise RuntimeError(f"expected exhaustion at B as obstruction, got {ob}")
+        print(f"  insufficient cooling correctly infeasible; exhaustion at {ob}")
+
+        # Initial level above capacity is an input error (400), never no_schedule.
+        bad_input = _cooling_five(
+            [1, 1, 1, 1, 1], {"capacity": 5, "initial": 6, "recovery": 1})
+        r3 = cli.post("/api/schedule", json=bad_input)
+        if r3.status_code != 400 or r3.json().get("reason") != "input_error":
+            raise RuntimeError(
+                f"expected 400 input_error for initial>capacity, got "
+                f"{r3.status_code} {r3.text[:200]}")
+
+
 def main() -> int:
     check_pytest()
     check_build()
     check_feasible()
     check_api_infeasible()
+    check_shared_cooling()
 
     bit = {"code tests (pytest)": 1, "build / static integrity": 2,
-           "feasible schedule": 4, "infeasible API smoke": 8}
+           "feasible schedule": 4, "infeasible API smoke": 8,
+           "shared-cooling API smoke": 16}
     code = 0
     print("\n=== summary ===")
     for name, ok in results.items():
         print(f"  {'PASS' if ok else 'FAIL'}  {name}")
         if not ok:
             code |= bit[name]
-    print(f"\nexit code: {code} (bitmask 1=tests 2=build 4=feasible 8=api-smoke)")
+    print(f"\nexit code: {code} (bitmask 1=tests 2=build 4=feasible "
+          f"8=api-smoke 16=cooling-smoke)")
     return code
 
 

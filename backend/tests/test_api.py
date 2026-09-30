@@ -102,3 +102,80 @@ def test_openapi_available():
     r = client.get("/openapi.json")
     assert r.status_code == 200
     assert "/api/schedule" in r.json()["paths"]
+
+
+def _cooling_body(consumptions, cooling, latest=None):
+    body = _body(exposures=[
+        _exposure(chr(65 + i), equipment=chr(88 + i), duration=1,
+                  startup_consumption=consumptions[i],
+                  **({"latest_start": latest} if latest is not None else {}))
+        for i in range(5)
+    ])
+    body["shared_cooling"] = cooling
+    return body
+
+
+def test_shared_cooling_feasible_returns_trace():
+    body = _cooling_body(
+        [3, 3, 3, 3, 3], {"capacity": 10, "initial": 10, "recovery": 5})
+    r = client.post("/api/schedule", json=body)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["feasible"] is True
+    trace = data["cooling_trace"]
+    assert trace is not None and len(trace) == 5
+    # Chronological order, ties broken by entry order.
+    times = [(s["start"], s["exposure_id"]) for s in trace]
+    assert times == sorted(times, key=lambda x: (x[0], x[1]))
+    for step in trace:
+        assert step["level_before"] - step["consumption"] == step["level_after"]
+        assert step["level_after"] >= 0
+    # Without cooling the same exposures all start at 0; cooling forces waits.
+    assert any(s > 0 for s in data["starts"])
+
+
+def test_shared_cooling_insufficient_is_200_no_schedule():
+    body = _cooling_body(
+        [6, 6, 0, 0, 0], {"capacity": 10, "initial": 10, "recovery": 0},
+        latest=4)
+    r = client.post("/api/schedule", json=body)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["feasible"] is False
+    assert data["reason"] == "no_schedule"
+    # Never a partial plan: every solution field is null, trace included.
+    for k in ("starts", "finishes", "makespan", "sum_starts",
+              "slacks", "equipment_orders", "cooling_trace"):
+        assert data[k] is None
+
+
+def test_shared_cooling_initial_over_capacity_is_400():
+    body = _cooling_body(
+        [1, 1, 1, 1, 1], {"capacity": 5, "initial": 6, "recovery": 1})
+    r = client.post("/api/schedule", json=body)
+    assert r.status_code == 400
+    data = r.json()
+    assert data["reason"] == "input_error"
+    assert any("initial" in m and "capacity" in m for m in data["field_errors"])
+
+
+def test_shared_cooling_obstruction_diagnostic():
+    # First 6-unit draw leaves 4; the second 6-unit draw can never fit within
+    # the tight window with zero recovery.
+    body = _cooling_body(
+        [6, 6, 0, 0, 0], {"capacity": 10, "initial": 10, "recovery": 0},
+        latest=4)
+    r = client.post("/api/schedule", json=body)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["feasible"] is False
+    ob = data["cooling_obstruction"]
+    assert ob == {"exposure_id": "B", "entry_index": 1, "feasible_count": 1}
+
+
+def test_disabled_cooling_response_shape_unchanged():
+    r = client.post("/api/schedule", json=_body())
+    assert r.status_code == 200
+    data = r.json()
+    assert "cooling_trace" not in data
+

@@ -13,6 +13,10 @@ class Exposure(BaseModel):
     latest_start: int = Field(..., ge=0)
     equipment: str = Field(..., min_length=1, max_length=64)
     cooling: int = Field(..., ge=0)
+    # Cryocooler capacity consumed by the instantaneous start event. Only
+    # meaningful when shared_cooling is enabled on the request; stays absent
+    # (or 0) for backwards-compatible requests.
+    startup_consumption: int = Field(default=0, ge=0)
 
     @field_validator("id", "equipment")
     @classmethod
@@ -21,6 +25,21 @@ class Exposure(BaseModel):
         if not v:
             raise ValueError("must not be empty")
         return v
+
+
+class SharedCooling(BaseModel):
+    """Shared cryocooler budget consumed at exposure start events.
+
+    The level is ``initial`` at time zero, recovers ``recovery`` units per
+    elapsed integer time unit (capped at ``capacity``), and startup draws
+    happen back-to-back in entry order among exposures sharing a start time
+    (no recovery between same-time starts). Every post-draw level must stay
+    non-negative.
+    """
+
+    capacity: int = Field(..., ge=0)
+    initial: int = Field(..., ge=0)
+    recovery: int = Field(..., ge=0)
 
 
 class Link(BaseModel):
@@ -40,6 +59,7 @@ class ScheduleRequest(BaseModel):
     horizon: int = Field(10_000, ge=1, le=1_000_000)
     exposures: List[Exposure] = Field(..., min_length=5, max_length=10)
     links: List[Link] = Field(default_factory=list)
+    shared_cooling: Optional[SharedCooling] = None
 
     @field_validator("links")
     @classmethod
@@ -62,9 +82,36 @@ class SlackInfo(BaseModel):
     slack: Optional[int] = None
 
 
+class CoolingStep(BaseModel):
+    """One startup draw against the shared cryocooler budget.
+
+    Steps are ordered by start time, then by exposure entry order, which is
+    exactly the order in which same-time draws are deducted back-to-back.
+    """
+
+    exposure_id: str
+    start: int
+    recovery: int          # units recovered since the previous startup event
+    level_before: int      # level right after that recovery, before the draw
+    consumption: int       # startup_consumption of this exposure
+    level_after: int       # level right after the draw (always >= 0)
+
+
 class EquipmentOrder(BaseModel):
     equipment: str
     sequence: List[str]
+
+
+class CoolingObstruction(BaseModel):
+    """Diagnostic: shared cooling alone makes the timing impossible.
+
+    ``entry_index`` is the first exposure (in entry order) whose inclusion
+    makes the cooling-only relaxation infeasible.
+    """
+
+    exposure_id: str
+    entry_index: int
+    feasible_count: int
 
 
 class SolutionPayload(BaseModel):
@@ -77,4 +124,6 @@ class SolutionPayload(BaseModel):
     sum_starts: Optional[int] = None
     slacks: Optional[List[SlackInfo]] = None
     equipment_orders: Optional[List[EquipmentOrder]] = None
+    cooling_trace: Optional[List[CoolingStep]] = None
+    cooling_obstruction: Optional[CoolingObstruction] = None
     solver_time_ms: Optional[int] = None
